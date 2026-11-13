@@ -1,0 +1,107 @@
+appId: io.dela.desktop
+productName: Dela
+artifactName: '${productName}-${version}-${os}-${arch}.${ext}'
+icon: assets/Dela_white_bg.png
+asar: true
+directories:
+  output: dist
+files:
+  - out/main/**/*
+  - out/preload/**/*
+  - out/renderer/**/*
+  - package.json
+  - assets/Dela_white_bg.png
+  - assets/Dela_black_bg.png
+  # 渲染层依赖已移入 devDependencies，由 Vite 打进 out/；
+  # 下面只兜底排除依赖收集中漏进产物或带全平台 prebuild 的部分。
+  # esbuild 是 Vite 的构建期工具，electron-builder 的 pnpm 依赖收集会漏收它。
+  - '!node_modules/@esbuild/**'
+  # native prebuild 按当前发布矩阵（win x64 / mac arm64）只保留目标平台
+  - '!node_modules/better-sqlite3/prebuilds/darwin-x64.node'
+  - '!node_modules/better-sqlite3/prebuilds/linux*'
+  - '!node_modules/better-sqlite3/prebuilds/win32-arm64.node'
+  - '!node_modules/node-pty/prebuilds/darwin-x64'
+  - '!node_modules/node-pty/prebuilds/linux*'
+  - '!node_modules/node-pty/prebuilds/win32-arm64'
+# Chromium 自带 55 种语言包（约 49MB），产品只面向中英文
+electronLanguages:
+  - en-US
+  - zh-CN
+  - zh-TW
+asarUnpack:
+  - node_modules/better-sqlite3/**/*
+  - node_modules/node-pty/**/*
+  # 课堂录音的语音识别原生库（.node 与 dylib 不能留在 asar 里）
+  - node_modules/sherpa-onnx-node/**/*
+  - node_modules/sherpa-onnx-darwin-arm64/**/*
+  - node_modules/sherpa-onnx-win-x64/**/*
+  # 引导开场的可选视频；文件不存在时该行无副作用
+  - out/renderer/assets/*.mp4
+extraResources:
+  # 远端 helper 的静态二进制：Dela 上传到远端后经 ssh -L 隧道访问（主进程按 resources/dela-helper 探测）
+  - from: vendor/dela-helper
+    to: dela-helper
+    filter:
+      - 'dela-helper-*'
+  # 两端共用搜索工具的来源与许可证；可执行文件按平台选择。
+  - from: vendor/bin
+    to: bin
+    filter:
+      - 'LICENSE-*.txt'
+      - 'README.md'
+npmRebuild: false
+win:
+  publish:
+    provider: generic
+    url: https://openlist.frameneo.com/sd/Dela_latest_release/
+    channel: latest
+    useMultipleRangeRequest: false
+  extraResources:
+    - from: vendor/openssh
+      to: openssh
+      filter:
+        - 'ssh.exe'
+        - 'libcrypto.dll'
+        - 'LICENSE.txt'
+        - 'NOTICE.txt'
+        - 'README.md'
+    - from: .build/mingit
+      to: mingit
+    - from: vendor/bin
+      to: bin
+      filter:
+        - '*.exe'
+  target:
+    - target: nsis
+      arch:
+        - x64
+mac:
+  icon: out/main/icons/Dela_white_bg.png
+  category: public.app-category.productivity
+  extendInfo:
+    NSMicrophoneUsageDescription: 课堂录音需要使用麦克风，录音与语音识别都在本机完成。
+  # 与 Windows 同一个 CDN 目录：electron-updater 据此生成 latest-mac.yml 并把
+  # app-update.yml 打进 .app；mac 更新走 zip，dmg 仅供首次安装。
+  publish:
+    provider: generic
+    url: https://openlist.frameneo.com/sd/Dela_latest_release/
+    channel: latest
+    useMultipleRangeRequest: false
+  target:
+    - target: dmg
+      arch:
+        - arm64
+    - target: zip
+      arch:
+        - arm64
+  extraResources:
+    - from: 'vendor/bin/darwin-${arch}'
+      to: 'bin/darwin-${arch}'
+      filter:
+        - 'rg'
+        - 'fd'
+nsis:
+  include: build/installer.nsh
+  oneClick: false
+  allowToChangeInstallationDirectory: true
+  differentialPackage: true

@@ -1,0 +1,40 @@
+# Dependencies, local tools and outputs
+node_modules/
+.tools/
+out/
+dist/
+.build/
+coverage/
+# 保留对迁移前本地原生构建产物的忽略。
+native/*/build/
+.playwright-cli/
+output/playwright/
+*.tsbuildinfo
+*.tgz
+!vendor/xlsx/*.tgz
+
+# Credentials and private reference files
+.env
+.env.*
+!.env.example
+*.mobileconfig
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Local application state
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+*.log
+.DS_Store
+Thumbs.db
+.idea/
+
+# LLM
+.zcode/
+.zcodeignore
+.pi/
+.playwright*/

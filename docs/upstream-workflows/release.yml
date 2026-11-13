@@ -1,0 +1,302 @@
+name: Release installers
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing version tag to publish (for example, v0.1.0)'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  macos:
+    needs: [prepare, helper]
+    name: Sign and notarize mac-arm64
+    runs-on: macos-15
+    environment: macos-release
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    env:
+      DELA_REMOTE_HOST: ''
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@v6
+        with:
+          name: helper-linux-amd64
+          path: vendor/dela-helper
+      - uses: actions/download-artifact@v6
+        with:
+          name: helper-linux-arm64
+          path: vendor/dela-helper
+      - uses: actions/setup-node@v6
+        with:
+          node-version-file: .node-version
+          package-manager-cache: false
+      - name: Verify runner architecture
+        run: node -e "if (process.platform !== 'darwin' || process.arch !== 'arm64') process.exit(1)"
+      - uses: pnpm/action-setup@v4
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Check and build
+        run: pnpm check
+      - name: Smoke test Electron
+        run: pnpm smoke
+      - name: Sign and notarize
+        env:
+          CSC_LINK: ${{ secrets.MAC_CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.MAC_CSC_KEY_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          mkdir -p .build
+          # .pak 语言数据由 Electron 框架的资源封印保护；逐文件签名会沿框架链接重复处理它们。
+          cat > .build/macos-release.json <<EOF
+          {
+            "extends": "$PWD/electron-builder.yml",
+            "forceCodeSigning": true,
+            "mac": {
+              "identity": "$APPLE_TEAM_ID",
+              "hardenedRuntime": true,
+              "notarize": true,
+              "binaries": [
+                "Contents/Resources/bin/darwin-arm64/rg",
+                "Contents/Resources/bin/darwin-arm64/fd"
+              ],
+              "signIgnore": ["\\\\.pak$"]
+            }
+          }
+          EOF
+          # notarytool 向 Apple 上传安装包并轮询结果，偶发网络失败是常态；整体重跑兜底，
+          # 每次重试前清空 dist 避免在已签名产物上续跑，30 秒退避，最多五次。
+          # 真伪签名问题由后面的 verify 步骤把关，这里不区分失败原因。
+          attempt=1
+          until pnpm exec electron-builder --config .build/macos-release.json --mac --arm64 --publish never; do
+            if [ "$attempt" -ge 5 ]; then
+              echo "Sign/notarize failed after $attempt attempts"
+              exit 1
+            fi
+            echo "::warning::Sign/notarize attempt $attempt failed, cleaning dist and retrying"
+            attempt=$((attempt + 1))
+            rm -rf dist
+            sleep 30
+          done
+      - name: Verify signatures, notarization and archives
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: node scripts/verify-macos-package.ts dist/mac-arm64/Dela.app --signed
+      - name: Verify update artifacts
+        run: |
+          test -f dist/mac-arm64/Dela.app/Contents/Resources/app-update.yml
+          test -f dist/latest-mac.yml || test -f dist/mac-arm64/latest-mac.yml
+          # electron-updater 的差量更新按 zip 直链 + .blockmap 探测，缺了就退回全量下载。
+          test -f dist/Dela-*-mac-arm64.zip.blockmap
+      - name: Smoke test signed app
+        run: dist/mac-arm64/Dela.app/Contents/MacOS/Dela --smoke-test
+      - name: Record artifact checksums and source
+        run: |
+          cd dist
+          shasum -a 256 Dela-*-mac-arm64.dmg Dela-*-mac-arm64.zip > SHA256SUMS-mac-arm64
+          git rev-parse HEAD > source-commit-mac-arm64.txt
+      - uses: actions/upload-artifact@v6
+        with:
+          name: installer-mac-arm64
+          path: |
+            dist/Dela-*-mac-arm64.dmg
+            dist/Dela-*-mac-arm64.zip
+            dist/Dela-*-mac-arm64.zip.blockmap
+            dist/latest-mac.yml
+            dist/mac-arm64/latest-mac.yml
+            dist/SHA256SUMS-mac-arm64
+            dist/source-commit-mac-arm64.txt
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+  prepare:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      checks: read
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+      sha: ${{ steps.version.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: refs/tags/${{ inputs.tag || github.ref_name }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Validate tag and package version
+        id: version
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          node --input-type=module <<'NODE'
+          import { readFileSync, appendFileSync } from 'node:fs';
+          import { execFileSync } from 'node:child_process';
+          const tag = process.env.RELEASE_TAG;
+          const { version } = JSON.parse(readFileSync('package.json', 'utf8'));
+          if (tag !== `v${version}` || !/^v\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(tag)) {
+            throw new Error('Tag must be v<package.json version>, optionally with a prerelease suffix');
+          }
+          const sha = execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+          appendFileSync(process.env.GITHUB_OUTPUT, `tag=${tag}\nsha=${sha}\n`);
+          NODE
+      - name: Require passing CI and an unpublished release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ steps.version.outputs.tag }}
+          SHA: ${{ steps.version.outputs.sha }}
+        run: |
+          ci="$(gh api "repos/$GH_REPO/commits/$SHA/check-runs?check_name=CI%20required&app_id=15368" \
+            --jq '.check_runs[0] | .conclusion // .status // "missing"')"
+          if [ "$ci" != success ]; then
+            echo "::error::CI required on $SHA is $ci; rerun this workflow after CI passes"
+            exit 1
+          fi
+          # electron-updater 只比版本号，已发布的版本换了构建，装过的用户永远拿不到。
+          if [ "$(gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft 2>/dev/null)" = false ]; then
+            echo "::error::$RELEASE_TAG is already published; release a new version instead"
+            exit 1
+          fi
+
+  helper:
+    needs: prepare
+    uses: ./.github/workflows/helper.yml
+    with:
+      ref: ${{ needs.prepare.outputs.sha }}
+
+  build:
+    needs: [prepare, helper]
+    name: Build win-x64
+    runs-on: windows-2022
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    env:
+      CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+      DELA_REMOTE_HOST: ''
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@v6
+        with:
+          name: helper-linux-amd64
+          path: vendor/dela-helper
+      - uses: actions/download-artifact@v6
+        with:
+          name: helper-linux-arm64
+          path: vendor/dela-helper
+      - uses: actions/setup-node@v6
+        with:
+          node-version-file: .node-version
+          package-manager-cache: false
+      - uses: pnpm/action-setup@v4
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Build and test
+        run: |
+          pnpm build:bundle
+          pnpm test
+      - name: Smoke test Electron
+        run: pnpm smoke
+      - name: Prepare bundled runtime
+        run: node scripts/prepare-runtime.ts
+      - name: Build installer
+        run: pnpm exec electron-builder --win --x64 --publish never
+      - name: Verify update artifacts
+        run: |
+          test -f dist/win-unpacked/resources/app-update.yml
+          test -f "dist/Dela-${RELEASE_TAG#v}-win-x64.exe"
+          test -f "dist/Dela-${RELEASE_TAG#v}-win-x64.exe.blockmap"
+          if [[ "$RELEASE_TAG" != *-* ]]; then test -f dist/latest.yml; fi
+        env:
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+      - name: Verify packaged helper
+        run: |
+          cmp vendor/dela-helper/dela-helper-linux-amd64 dist/win-unpacked/resources/dela-helper/dela-helper-linux-amd64
+          cmp vendor/dela-helper/dela-helper-linux-arm64 dist/win-unpacked/resources/dela-helper/dela-helper-linux-arm64
+      - name: Smoke test packaged app
+        env:
+          PACKAGED_EXECUTABLE: dist/win-unpacked/Dela.exe
+        run: '"$PACKAGED_EXECUTABLE" --smoke-test'
+      - uses: actions/upload-artifact@v6
+        with:
+          name: installer-win-x64
+          path: |
+            dist/*.exe
+            dist/*.exe.blockmap
+            dist/latest.yml
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+  release:
+    needs: [prepare, build, macos]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/download-artifact@v6
+        with:
+          name: installer-win-x64
+          path: installers
+      - uses: actions/download-artifact@v6
+        with:
+          name: installer-mac-arm64
+          path: installers-macos
+      - name: Collect Mac release files
+        run: find installers-macos -type f -exec cp -t installers -- {} +
+      - name: Create and publish release
+        shell: bash
+        run: |
+          prerelease=()
+          if [[ "$RELEASE_TAG" == *-* ]]; then
+            prerelease=(--prerelease)
+          fi
+          previous_tag="$(git describe --tags --abbrev=0 "${RELEASE_TAG}^" 2>/dev/null || true)"
+          {
+            echo '## 提交记录'
+            echo
+            if [[ -n "$previous_tag" ]]; then
+              git log --no-merges --format='- %s (`%h`)' "${previous_tag}..${RELEASE_TAG}"
+            else
+              git log --no-merges --format='- %s (`%h`)' "$RELEASE_TAG"
+            fi
+          } > release-notes.md
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" installers/* --clobber
+          else
+            gh release create "$RELEASE_TAG" installers/* \
+              --verify-tag --draft --generate-notes --notes-file release-notes.md --title "$RELEASE_TAG" "${prerelease[@]}"
+          fi
+          gh release edit "$RELEASE_TAG" --draft=false

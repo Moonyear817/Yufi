@@ -1,0 +1,14 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": { "lib": ["ES2023"], "types": ["node"] },
+  "include": [
+    "scripts/build-helper.ts",
+    "scripts/dev.ts",
+    "scripts/document-runtime-smoke.ts",
+    "scripts/fix-native-permissions.ts",
+    "scripts/prepare-runtime.ts",
+    "scripts/run-ts-smoke.ts",
+    "scripts/verify-macos-package.ts",
+    "src/main/modules.d.ts"
+  ]
+}

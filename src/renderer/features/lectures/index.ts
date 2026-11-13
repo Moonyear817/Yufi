@@ -1,0 +1,1 @@
+export { LecturesView } from './LecturesView';
